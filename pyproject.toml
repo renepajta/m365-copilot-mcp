@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "m365-copilot-mcp"
+version = "0.1.0"
+description = "MCP server for Microsoft 365 Copilot APIs - bring enterprise data into GitHub Copilot & Claude Desktop"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "René Pajta", email = "renepajta@users.noreply.github.com" }
+]
+keywords = ["mcp", "microsoft-365", "copilot", "graph-api", "ai", "enterprise"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "mcp>=1.9.0",
+    "azure-identity>=1.19.0",
+    "msgraph-sdk>=1.0.0",
+    "httpx>=0.27.0",
+    "httpx-sse>=0.4.0",
+    "pydantic>=2.10.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "respx>=0.22.0",
+]
+
+[project.scripts]
+m365-copilot = "m365_copilot.server:main"
+
+[project.urls]
+Homepage = "https://github.com/renepajta/m365-copilot-mcp"
+Repository = "https://github.com/renepajta/m365-copilot-mcp"
+Issues = "https://github.com/renepajta/m365-copilot-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/m365_copilot"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
