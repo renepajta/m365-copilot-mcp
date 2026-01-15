@@ -574,6 +574,11 @@ def main():
         default=8000,
         help="HTTP server port (default: 8000)",
     )
+    parser.add_argument(
+        "--auth",
+        action="store_true",
+        help="Authenticate interactively and save credentials for future use",
+    )
     args = parser.parse_args()
 
     # Validate required environment variables
@@ -581,6 +586,21 @@ def main():
         logger.warning("AZURE_CLIENT_ID not set - authentication will fail")
     if not os.getenv("AZURE_TENANT_ID"):
         logger.warning("AZURE_TENANT_ID not set - authentication will fail")
+
+    # Handle one-time authentication
+    if args.auth:
+        from m365_copilot.auth import authenticate_and_save
+        print("🔐 Starting interactive authentication...")
+        print("   A browser window will open. Sign in with your M365 account.")
+        print()
+        try:
+            record = authenticate_and_save()
+            print(f"✅ Authenticated as: {record.username}")
+            print(f"   Credentials saved. Future runs will use cached tokens.")
+        except Exception as e:
+            print(f"❌ Authentication failed: {e}")
+            raise SystemExit(1)
+        return
 
     if args.http:
         logger.info("Starting HTTP server on port %d", args.port)

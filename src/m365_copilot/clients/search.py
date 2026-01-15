@@ -1,8 +1,9 @@
 """Search API client for M365 Copilot.
 
 Semantic document search in OneDrive.
+Uses official Microsoft SDK (microsoft-agents-m365copilot-beta).
 
-Endpoint: POST /beta/copilot/search
+Endpoint: POST /copilot/search
 """
 
 from __future__ import annotations
@@ -11,8 +12,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from microsoft_agents_m365copilot_beta import AgentsM365CopilotBetaServiceClient
+from microsoft_agents_m365copilot_beta.generated.copilot.search.search_post_request_body import (
+    SearchPostRequestBody,
+)
+
 from m365_copilot.clients.base import (
-    GraphClient,
     gen_request_id,
     truncate_query,
 )
@@ -89,8 +94,8 @@ class SearchResponse:
         return "\n".join(lines)
 
 
-class SearchClient(GraphClient):
-    """Client for M365 Copilot Search API."""
+class SearchClient:
+    """Client for M365 Copilot Search API using official Microsoft SDK."""
 
     def __init__(
         self,
@@ -98,7 +103,12 @@ class SearchClient(GraphClient):
         *,
         timeout: int | None = None,
     ) -> None:
-        super().__init__(credential, timeout=timeout or SEARCH_TIMEOUT)
+        self.credential = credential
+        self.timeout = timeout or SEARCH_TIMEOUT
+        
+        # Create SDK client with correct beta API configuration
+        from m365_copilot.auth import create_sdk_client
+        self._sdk_client = create_sdk_client(credential)
 
     async def search(
         self,
@@ -119,7 +129,6 @@ class SearchClient(GraphClient):
             SearchResponse with document results.
         """
         request_id = request_id or gen_request_id()
-        url = f"{self.BETA_BASE_URL}/copilot/search"
 
         logger.info(
             "[%s] Search: %s (path=%s, size=%d)",
@@ -129,71 +138,84 @@ class SearchClient(GraphClient):
             page_size,
         )
 
-        # Build request body
-        body: dict[str, Any] = {
-            "query": query,
-            "pageSize": min(max(1, page_size), 100),  # Clamp to 1-100
-        }
+        # Build request body using SDK model
+        request_body = SearchPostRequestBody()
+        request_body.query = query
+        request_body.page_size = min(max(1, page_size), 100)  # Clamp to 1-100
 
-        # Add path filter if provided
+        # Add path filter via additional_data if provided
         if path_filter:
-            body["filter"] = {
-                "path": path_filter,
-            }
+            request_body.additional_data["filter"] = {"path": path_filter}
 
-        response = await self._make_request(
-            "POST",
-            url,
-            json=body,
-            request_id=request_id,
-        )
-
-        if response.status_code != 200:
-            logger.error(
-                "[%s] Search failed: %d %s",
+        try:
+            # Call SDK search endpoint
+            result = await self._sdk_client.copilot.search.post(request_body)
+            
+            if result is None:
+                return SearchResponse(results=[], total_results=0)
+            
+            results = self._parse_results_from_sdk(result)
+            
+            logger.info(
+                "[%s] Found %d documents",
                 request_id,
-                response.status_code,
-                response.text,
-            )
-            raise SearchApiError(
-                f"Search failed: {response.status_code} - {response.text}"
+                len(results),
             )
 
-        data = response.json()
-        results = self._parse_results(data)
+            return SearchResponse(
+                results=results,
+                total_results=result.total_count or len(results),
+            )
+            
+        except Exception as e:
+            logger.error(
+                "[%s] Search failed: %s",
+                request_id,
+                str(e),
+            )
+            raise SearchApiError(f"Search failed: {e}")
 
-        logger.info(
-            "[%s] Found %d documents",
-            request_id,
-            len(results),
-        )
-
-        return SearchResponse(
-            results=results,
-            total_results=data.get("totalCount", len(results)),
-        )
-
-    def _parse_results(self, data: dict[str, Any]) -> list[SearchResult]:
-        """Parse results from API response."""
+    def _parse_results_from_sdk(self, result: Any) -> list[SearchResult]:
+        """Parse results from SDK response."""
         results = []
 
-        for item in data.get("value", []):
-            # Extract resource data
-            resource = item.get("resource", {})
+        if not hasattr(result, 'search_hits') or result.search_hits is None:
+            return results
 
-            result = SearchResult(
-                name=resource.get("name", "Untitled"),
-                url=resource.get("webUrl", ""),
-                preview=item.get("summary", ""),
-                file_type=resource.get("file", {}).get("mimeType"),
-                size=resource.get("size"),
-                last_modified=resource.get("lastModifiedDateTime"),
-                author=resource.get("lastModifiedBy", {})
-                .get("user", {})
-                .get("displayName"),
-                path=resource.get("parentReference", {}).get("path"),
+        for hit in result.search_hits:
+            # Extract metadata from hit
+            name = "Untitled"
+            url = hit.web_url or ""
+            preview = hit.preview or ""
+            file_type = None
+            size = None
+            last_modified = None
+            author = None
+            path = None
+            
+            if hit.resource_type:
+                file_type = str(hit.resource_type.value) if hasattr(hit.resource_type, 'value') else str(hit.resource_type)
+            
+            # Extract from resource_metadata if available
+            if hit.resource_metadata and hasattr(hit.resource_metadata, 'additional_data'):
+                metadata = hit.resource_metadata.additional_data
+                name = metadata.get('name', name)
+                size = metadata.get('size')
+                last_modified = metadata.get('lastModifiedDateTime')
+                author = metadata.get('lastModifiedBy', {}).get('user', {}).get('displayName') if isinstance(metadata.get('lastModifiedBy'), dict) else None
+                path = metadata.get('parentReference', {}).get('path') if isinstance(metadata.get('parentReference'), dict) else None
+
+            result_item = SearchResult(
+                name=name,
+                url=url,
+                preview=preview,
+                file_type=file_type,
+                size=size,
+                last_modified=last_modified,
+                author=author,
+                path=path,
             )
-            results.append(result)
+            results.append(result_item)
 
         return results
 

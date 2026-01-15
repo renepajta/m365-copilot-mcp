@@ -70,31 +70,38 @@ class TestChatClient:
     @pytest.mark.asyncio
     async def test_create_conversation_success(self, mock_credential):
         """Should create conversation and return ID."""
-        client = ChatClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 201
-        mock_response.json.return_value = {"id": "new-conv-123"}
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        # Patch the SDK client before ChatClient instantiation
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ) as mock_sdk_class:
+            # Create mock SDK client instance
+            mock_sdk = MagicMock()
+            mock_sdk_class.return_value = mock_sdk
             
+            # Mock the conversation creation
+            mock_result = MagicMock()
+            mock_result.id = "new-conv-123"
+            mock_sdk.copilot.conversations.post = AsyncMock(return_value=mock_result)
+            
+            client = ChatClient(mock_credential)
             result = await client.create_conversation()
             
             assert result == "new-conv-123"
-            mock_req.assert_called_once()
+            mock_sdk.copilot.conversations.post.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_create_conversation_failure(self, mock_credential):
         """Should raise ChatApiError on failure."""
-        client = ChatClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = "Bad request"
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ) as mock_sdk_class:
+            mock_sdk = MagicMock()
+            mock_sdk_class.return_value = mock_sdk
+            mock_sdk.copilot.conversations.post = AsyncMock(
+                side_effect=Exception("API error")
+            )
+            
+            client = ChatClient(mock_credential)
             
             with pytest.raises(ChatApiError):
                 await client.create_conversation()

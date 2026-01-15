@@ -77,30 +77,40 @@ class TestSearchClient:
         cred.get_token.return_value = MagicMock(token="test-token")
         return cred
 
+    @pytest.fixture
+    def mock_sdk_client(self):
+        """Create mock SDK client."""
+        mock_client = MagicMock()
+        mock_client.copilot = MagicMock()
+        mock_client.copilot.search = MagicMock()
+        mock_client.copilot.search.post = AsyncMock()
+        return mock_client
+
     @pytest.mark.asyncio
-    async def test_search_success(self, mock_credential):
+    async def test_search_success(self, mock_credential, mock_sdk_client):
         """Should search and parse results."""
-        client = SearchClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "value": [
-                {
-                    "resource": {
-                        "name": "Report.docx",
-                        "webUrl": "https://example.com/report",
-                        "size": 50000,
-                    },
-                    "summary": "Quarterly report summary...",
-                }
-            ],
-            "totalCount": 1,
+        # Create mock SDK response
+        mock_hit = MagicMock()
+        mock_hit.web_url = "https://example.com/report"
+        mock_hit.preview = "Quarterly report summary..."
+        mock_hit.resource_type = None
+        mock_hit.resource_metadata = MagicMock()
+        mock_hit.resource_metadata.additional_data = {
+            "name": "Report.docx",
+            "size": 50000,
         }
         
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
-            
+        mock_response = MagicMock()
+        mock_response.search_hits = [mock_hit]
+        mock_response.total_count = 1
+        
+        mock_sdk_client.copilot.search.post.return_value = mock_response
+        
+        with patch(
+            "m365_copilot.auth.create_sdk_client",
+            return_value=mock_sdk_client,
+        ):
+            client = SearchClient(mock_credential)
             result = await client.search("quarterly report")
             
             assert len(result.results) == 1
@@ -108,55 +118,77 @@ class TestSearchClient:
             assert result.total_results == 1
 
     @pytest.mark.asyncio
-    async def test_search_with_path_filter(self, mock_credential):
+    async def test_search_with_path_filter(self, mock_credential, mock_sdk_client):
         """Should include path filter in request."""
-        client = SearchClient(mock_credential)
-        
         mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"value": [], "totalCount": 0}
+        mock_response.search_hits = []
+        mock_response.total_count = 0
         
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
-            
+        mock_sdk_client.copilot.search.post.return_value = mock_response
+        
+        with patch(
+            "m365_copilot.auth.create_sdk_client",
+            return_value=mock_sdk_client,
+        ):
+            client = SearchClient(mock_credential)
             await client.search(
                 "test query",
                 path_filter="/Documents/Projects",
             )
             
-            call_args = mock_req.call_args
-            assert call_args is not None
+            # Verify SDK was called
+            mock_sdk_client.copilot.search.post.assert_called_once()
+            call_args = mock_sdk_client.copilot.search.post.call_args
+            request_body = call_args[0][0]
+            assert request_body.query == "test query"
 
     @pytest.mark.asyncio
-    async def test_search_failure(self, mock_credential):
+    async def test_search_failure(self, mock_credential, mock_sdk_client):
         """Should raise SearchApiError on failure."""
-        client = SearchClient(mock_credential)
+        mock_sdk_client.copilot.search.post.side_effect = Exception("API error")
         
-        mock_response = MagicMock()
-        mock_response.status_code = 400
-        mock_response.text = "Bad request"
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        with patch(
+            "m365_copilot.auth.create_sdk_client",
+            return_value=mock_sdk_client,
+        ):
+            client = SearchClient(mock_credential)
             
             with pytest.raises(SearchApiError):
                 await client.search("test query")
 
     @pytest.mark.asyncio
-    async def test_search_page_size_clamped(self, mock_credential):
+    async def test_search_page_size_clamped(self, mock_credential, mock_sdk_client):
         """Should clamp page_size to valid range."""
-        client = SearchClient(mock_credential)
-        
         mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"value": []}
+        mock_response.search_hits = []
+        mock_response.total_count = 0
         
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        mock_sdk_client.copilot.search.post.return_value = mock_response
+        
+        with patch(
+            "m365_copilot.auth.create_sdk_client",
+            return_value=mock_sdk_client,
+        ):
+            client = SearchClient(mock_credential)
             
             # Test with value above max
             await client.search("test", page_size=500)
             
-            call_kwargs = mock_req.call_args[1]
-            body = call_kwargs.get("json", {})
-            assert body.get("pageSize", 0) <= 100
+            call_args = mock_sdk_client.copilot.search.post.call_args
+            request_body = call_args[0][0]
+            assert request_body.page_size <= 100
+
+    @pytest.mark.asyncio
+    async def test_search_empty_response(self, mock_credential, mock_sdk_client):
+        """Should handle empty/null response."""
+        mock_sdk_client.copilot.search.post.return_value = None
+        
+        with patch(
+            "m365_copilot.auth.create_sdk_client",
+            return_value=mock_sdk_client,
+        ):
+            client = SearchClient(mock_credential)
+            result = await client.search("test query")
+            
+            assert len(result.results) == 0
+            assert result.total_results == 0

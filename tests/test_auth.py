@@ -9,6 +9,9 @@ from m365_copilot.auth import (
     get_credential,
     GRAPH_SCOPES,
     DEFAULT_CACHE_DIR,
+    _load_auth_record,
+    _save_auth_record,
+    _get_auth_record_path,
 )
 
 
@@ -49,11 +52,12 @@ class TestGetCredential:
             with pytest.raises(ValueError, match="AZURE_TENANT_ID is required"):
                 get_credential()
 
+    @patch("m365_copilot.auth._load_auth_record", return_value=None)
     @patch("m365_copilot.auth.ChainedTokenCredential")
     @patch("m365_copilot.auth.DeviceCodeCredential")
     @patch("m365_copilot.auth.InteractiveBrowserCredential")
     def test_creates_chained_credential(
-        self, mock_browser, mock_device, mock_chained
+        self, mock_browser, mock_device, mock_chained, mock_load_record
     ):
         """Should create chained credential with browser and device code."""
         with patch.dict(
@@ -67,9 +71,11 @@ class TestGetCredential:
         mock_device.assert_called_once()
         mock_chained.assert_called_once()
 
+    @patch("m365_copilot.auth._load_auth_record", return_value=None)
     @patch("m365_copilot.auth.ChainedTokenCredential")
     @patch("m365_copilot.auth.DeviceCodeCredential")
-    def test_no_browser_when_disabled(self, mock_device, mock_chained):
+    @patch("m365_copilot.auth.SharedTokenCacheCredential")
+    def test_no_browser_when_disabled(self, mock_shared, mock_device, mock_chained, mock_load_record):
         """Should skip browser credential when allow_browser=False."""
         with patch.dict(
             "os.environ",
@@ -79,9 +85,9 @@ class TestGetCredential:
                 get_credential(allow_browser=False)
 
         mock_device.assert_called_once()
-        # Chained should only have device credential
+        # Chained should have shared cache + device credential (no browser)
         call_args = mock_chained.call_args[0]
-        assert len(call_args) == 1
+        assert len(call_args) == 2  # SharedTokenCacheCredential + DeviceCodeCredential
 
 
 class TestGraphScopes:
@@ -102,3 +108,48 @@ class TestGraphScopes:
         """All scopes should be fully qualified with graph.microsoft.com."""
         for scope in GRAPH_SCOPES:
             assert scope.startswith("https://graph.microsoft.com/")
+
+
+class TestAuthRecord:
+    """Tests for authentication record persistence."""
+
+    def test_auth_record_path_uses_cache_dir(self):
+        """Auth record path should be under cache directory."""
+        with patch.dict("os.environ", {}, clear=True):
+            path = _get_auth_record_path()
+            assert path.parent == DEFAULT_CACHE_DIR
+            assert path.name == "auth_record.json"
+
+    def test_load_auth_record_returns_none_when_missing(self, tmp_path):
+        """Should return None when auth record doesn't exist."""
+        with patch("m365_copilot.auth.get_cache_dir", return_value=tmp_path):
+            result = _load_auth_record()
+            assert result is None
+
+    @patch("m365_copilot.auth.AuthenticationRecord")
+    def test_uses_saved_auth_record_when_available(self, mock_auth_record):
+        """Should use saved auth record for silent authentication."""
+        mock_record = MagicMock()
+        mock_record.username = "user@example.com"
+
+        with patch.dict(
+            "os.environ",
+            {"AZURE_CLIENT_ID": "client123", "AZURE_TENANT_ID": "tenant123"},
+        ):
+            with patch("m365_copilot.auth._load_auth_record", return_value=mock_record):
+                with patch("m365_copilot.auth.ChainedTokenCredential") as mock_chained:
+                    with patch("m365_copilot.auth.InteractiveBrowserCredential") as mock_browser:
+                        with patch("m365_copilot.auth.SharedTokenCacheCredential"):
+                            with patch("m365_copilot.auth.DeviceCodeCredential"):
+                                with patch("pathlib.Path.mkdir"):
+                                    get_credential()
+
+        # Should create InteractiveBrowserCredential twice:
+        # 1. Silent credential with auth record
+        # 2. Interactive fallback
+        assert mock_browser.call_count == 2
+
+        # First call should have auth record and disable_automatic_authentication
+        first_call = mock_browser.call_args_list[0]
+        assert first_call.kwargs.get("authentication_record") == mock_record
+        assert first_call.kwargs.get("disable_automatic_authentication") is True

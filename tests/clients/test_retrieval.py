@@ -9,6 +9,9 @@ from m365_copilot.clients.retrieval import (
     TextChunk,
     RetrievalApiError,
 )
+from microsoft_agents_m365copilot_beta.generated.models.retrieval_data_source import (
+    RetrievalDataSource,
+)
 
 
 class TestTextChunk:
@@ -67,24 +70,30 @@ class TestRetrievalClient:
     @pytest.mark.asyncio
     async def test_retrieve_success(self, mock_credential):
         """Should retrieve and parse chunks."""
-        client = RetrievalClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "value": [
-                {
-                    "content": "Test content",
-                    "relevanceScore": 0.85,
-                    "webUrl": "https://example.com/doc",
-                    "name": "Test Doc",
-                }
-            ]
-        }
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ) as mock_sdk_class:
+            mock_sdk = MagicMock()
+            mock_sdk_class.return_value = mock_sdk
             
+            # Mock SDK response
+            mock_extract = MagicMock()
+            mock_extract.text = "Test content"
+            mock_extract.relevance_score = 0.85
+            
+            mock_hit = MagicMock()
+            mock_hit.web_url = "https://example.com/doc"
+            mock_hit.resource_metadata = MagicMock()
+            mock_hit.resource_metadata.additional_data = {"title": "Test Doc"}
+            mock_hit.resource_type = None
+            mock_hit.extracts = [mock_extract]
+            
+            mock_result = MagicMock()
+            mock_result.retrieval_hits = [mock_hit]
+            
+            mock_sdk.copilot.retrieval.post = AsyncMock(return_value=mock_result)
+            
+            client = RetrievalClient(mock_credential)
             result = await client.retrieve("test query")
             
             assert len(result.chunks) == 1
@@ -94,43 +103,53 @@ class TestRetrievalClient:
     @pytest.mark.asyncio
     async def test_retrieve_with_filter(self, mock_credential):
         """Should include filter in request."""
-        client = RetrievalClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"value": []}
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ) as mock_sdk_class:
+            mock_sdk = MagicMock()
+            mock_sdk_class.return_value = mock_sdk
             
+            mock_result = MagicMock()
+            mock_result.retrieval_hits = []
+            
+            mock_sdk.copilot.retrieval.post = AsyncMock(return_value=mock_result)
+            
+            client = RetrievalClient(mock_credential)
             await client.retrieve(
                 "test query",
                 filter_expression="FileType:pdf",
             )
             
             # Check that filter was included in request body
-            call_args = mock_req.call_args
+            call_args = mock_sdk.copilot.retrieval.post.call_args
             assert call_args is not None
+            request_body = call_args[0][0]
+            assert request_body.filter_expression == "FileType:pdf"
 
     @pytest.mark.asyncio
     async def test_retrieve_failure(self, mock_credential):
         """Should raise RetrievalApiError on failure."""
-        client = RetrievalClient(mock_credential)
-        
-        mock_response = MagicMock()
-        mock_response.status_code = 500
-        mock_response.text = "Server error"
-        
-        with patch.object(client, "_make_request", new_callable=AsyncMock) as mock_req:
-            mock_req.return_value = mock_response
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ) as mock_sdk_class:
+            mock_sdk = MagicMock()
+            mock_sdk_class.return_value = mock_sdk
+            mock_sdk.copilot.retrieval.post = AsyncMock(
+                side_effect=Exception("API error")
+            )
+            
+            client = RetrievalClient(mock_credential)
             
             with pytest.raises(RetrievalApiError):
                 await client.retrieve("test query")
 
     def test_data_source_mapping(self, mock_credential):
         """Should map data source types correctly."""
-        client = RetrievalClient(mock_credential)
-        
-        assert client.DATA_SOURCES["sharepoint"] == "microsoft365SharePoint"
-        assert client.DATA_SOURCES["onedrive"] == "microsoft365OneDrive"
-        assert client.DATA_SOURCES["connectors"] == "copilotConnectors"
+        with patch(
+            "m365_copilot.auth.create_sdk_client"
+        ):
+            client = RetrievalClient(mock_credential)
+            
+            assert client.DATA_SOURCE_MAP["sharepoint"] == RetrievalDataSource.SharePoint
+            assert client.DATA_SOURCE_MAP["onedrive"] == RetrievalDataSource.OneDriveBusiness
+            assert client.DATA_SOURCE_MAP["connectors"] == RetrievalDataSource.ExternalItem

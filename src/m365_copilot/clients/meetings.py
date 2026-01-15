@@ -1,10 +1,11 @@
 """Meeting Insights API client for M365 Copilot.
 
 Gets AI-generated summaries and action items from Teams meetings.
+Uses official Microsoft SDK (microsoft-agents-m365copilot-beta).
 
 Endpoints:
-- GET /v1.0/copilot/users/{userId}/onlineMeetings/{meetingId}/aiInsights
-- GET /v1.0/copilot/users/{userId}/onlineMeetings/{meetingId}/aiInsights/{insightId}
+- GET /copilot/users/{userId}/onlineMeetings
+- GET /copilot/users/{userId}/onlineMeetings/{meetingId}/aiInsights
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
-from m365_copilot.clients.base import (
-    GraphClient,
-    gen_request_id,
-)
+import httpx
+from microsoft_agents_m365copilot_beta import AgentsM365CopilotBetaServiceClient
+
+from m365_copilot.clients.base import gen_request_id
 
 if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
@@ -122,8 +123,8 @@ class MeetingSummary:
         return f"- **{self.title}** ({self.start_time})\n  ID: `{self.meeting_id}`"
 
 
-class MeetingsClient(GraphClient):
-    """Client for M365 Copilot Meeting Insights API."""
+class MeetingsClient:
+    """Client for M365 Copilot Meeting Insights API using official Microsoft SDK."""
 
     def __init__(
         self,
@@ -131,7 +132,12 @@ class MeetingsClient(GraphClient):
         *,
         timeout: int | None = None,
     ) -> None:
-        super().__init__(credential, timeout=timeout or MEETINGS_TIMEOUT)
+        self.credential = credential
+        self.timeout = timeout or MEETINGS_TIMEOUT
+        
+        # Create SDK client with correct beta API configuration
+        from m365_copilot.auth import create_sdk_client
+        self._sdk_client = create_sdk_client(credential)
 
     async def list_meetings(
         self,
@@ -140,6 +146,10 @@ class MeetingsClient(GraphClient):
         request_id: str | None = None,
     ) -> list[MeetingSummary]:
         """List recent meetings with available insights.
+
+        Note: The standard Graph /me/onlineMeetings endpoint requires a filter.
+        This method uses the /me/calendar/events endpoint with $filter for meetings
+        since the Copilot-specific endpoint may not be available in all tenants.
 
         Args:
             since: Only include meetings after this datetime.
@@ -154,50 +164,126 @@ class MeetingsClient(GraphClient):
         if since is None:
             since = datetime.now(timezone.utc) - timedelta(days=7)
 
-        # Get current user ID
-        user_id = await self._get_current_user_id(request_id)
-
-        # List meetings with calendar events that have online meeting info
-        url = (
-            f"{self.V1_BASE_URL}/users/{user_id}/onlineMeetings"
-            f"?$filter=startDateTime ge {since.isoformat()}"
-            f"&$orderby=startDateTime desc"
-            f"&$top=50"
-        )
-
         logger.info("[%s] Listing meetings since %s", request_id, since.date())
 
-        response = await self._make_request(
-            "GET",
-            url,
-            request_id=request_id,
-        )
+        # First try the Copilot-specific endpoint
+        try:
+            return await self._list_meetings_copilot(since, request_id)
+        except MeetingsApiError as e:
+            if "NotFound" in str(e) or "not supported" in str(e).lower():
+                logger.info("[%s] Copilot meetings endpoint not available, using calendar events", request_id)
+            else:
+                raise
 
-        if response.status_code != 200:
-            logger.error(
-                "[%s] List meetings failed: %d %s",
-                request_id,
-                response.status_code,
-                response.text,
-            )
-            raise MeetingsApiError(
-                f"Failed to list meetings: {response.status_code}"
-            )
+        # Fall back to calendar events (which shows Teams meetings)
+        return await self._list_meetings_calendar(since, request_id)
 
-        data = response.json()
-        meetings = []
+    async def _list_meetings_copilot(
+        self,
+        since: datetime,
+        request_id: str,
+    ) -> list[MeetingSummary]:
+        """List meetings using Copilot-specific endpoint."""
+        user_id = await self._get_current_user_id(request_id)
 
-        for item in data.get("value", []):
-            meeting = MeetingSummary(
-                meeting_id=item.get("id", ""),
-                title=item.get("subject", "Untitled Meeting"),
-                start_time=item.get("startDateTime", ""),
-                join_url=item.get("joinWebUrl"),
-            )
-            meetings.append(meeting)
+        try:
+            # Use SDK to get online meetings
+            result = await self._sdk_client.copilot.users.by_ai_user_id(
+                user_id
+            ).online_meetings.get()
+            
+            meetings = []
+            
+            if result and result.value:
+                for item in result.value:
+                    # Filter by start time
+                    if hasattr(item, 'start_date_time') and item.start_date_time:
+                        meeting_time = item.start_date_time
+                        if isinstance(meeting_time, datetime):
+                            if meeting_time < since:
+                                continue
+                    
+                    meeting = MeetingSummary(
+                        meeting_id=item.id or "",
+                        title=getattr(item, 'subject', None) or "Untitled Meeting",
+                        start_time=str(item.start_date_time) if hasattr(item, 'start_date_time') and item.start_date_time else "",
+                        join_url=getattr(item, 'join_web_url', None),
+                    )
+                    meetings.append(meeting)
 
-        logger.info("[%s] Found %d meetings", request_id, len(meetings))
-        return meetings
+            logger.info("[%s] Found %d meetings via Copilot endpoint", request_id, len(meetings))
+            return meetings
+            
+        except Exception as e:
+            raise MeetingsApiError(f"Failed to list meetings: {e}")
+
+    async def _list_meetings_calendar(
+        self,
+        since: datetime,
+        request_id: str,
+    ) -> list[MeetingSummary]:
+        """List meetings using calendar events endpoint (fallback).
+        
+        Uses /me/calendar/calendarView to get meetings with Teams join URLs.
+        """
+        from m365_copilot.auth import GRAPH_SCOPES
+        
+        try:
+            token = self.credential.get_token(*GRAPH_SCOPES)
+            
+            # Use calendarView with date range
+            since_str = since.strftime('%Y-%m-%dT%H:%M:%SZ')
+            until = datetime.now(timezone.utc) + timedelta(days=30)  # Include upcoming
+            until_str = until.strftime('%Y-%m-%dT%H:%M:%SZ')
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://graph.microsoft.com/v1.0/me/calendar/calendarView",
+                    params={
+                        "startDateTime": since_str,
+                        "endDateTime": until_str,
+                        "$filter": "isOnlineMeeting eq true",
+                        "$select": "id,subject,start,end,onlineMeeting,isOnlineMeeting",
+                        "$orderby": "start/dateTime desc",
+                        "$top": "50",
+                    },
+                    headers={"Authorization": f"Bearer {token.token}"},
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+                data = response.json()
+            
+            meetings = []
+            for event in data.get("value", []):
+                # Extract meeting info
+                online_meeting = event.get("onlineMeeting", {}) or {}
+                join_url = online_meeting.get("joinUrl")
+                
+                # Try to extract meeting ID from join URL
+                meeting_id = ""
+                if join_url:
+                    match = re.search(r"19:meeting_([^/]+)", join_url)
+                    if match:
+                        meeting_id = match.group(0)
+                
+                start_info = event.get("start", {})
+                start_time = start_info.get("dateTime", "")
+                
+                meeting = MeetingSummary(
+                    meeting_id=meeting_id or event.get("id", ""),
+                    title=event.get("subject") or "Untitled Meeting",
+                    start_time=start_time,
+                    join_url=join_url,
+                )
+                meetings.append(meeting)
+            
+            logger.info("[%s] Found %d meetings via calendar", request_id, len(meetings))
+            return meetings
+            
+        except httpx.HTTPStatusError as e:
+            raise MeetingsApiError(f"Failed to list meetings: HTTP {e.response.status_code}")
+        except Exception as e:
+            raise MeetingsApiError(f"Failed to list meetings: {e}")
 
     async def get_insights(
         self,
@@ -226,71 +312,92 @@ class MeetingsClient(GraphClient):
 
         user_id = await self._get_current_user_id(request_id)
 
-        url = (
-            f"{self.V1_BASE_URL}/copilot/users/{user_id}"
-            f"/onlineMeetings/{meeting_id}/aiInsights"
-        )
-
         logger.info("[%s] Getting insights for meeting %s", request_id, meeting_id)
 
-        response = await self._make_request(
-            "GET",
-            url,
-            request_id=request_id,
-        )
+        try:
+            # Use SDK to get AI insights
+            # The SDK endpoint: copilot/users/{userId}/onlineMeetings/{meetingId}/aiInsights
+            result = await self._sdk_client.copilot.users.by_ai_user_id(
+                user_id
+            ).online_meetings.by_ai_online_meeting_id(
+                meeting_id
+            ).ai_insights.get()
+            
+            if result is None or (hasattr(result, 'value') and not result.value):
+                return MeetingInsight(
+                    meeting_id=meeting_id,
+                    notes=[
+                        MeetingNote(
+                            title="No Insights Available",
+                            text="AI insights are not yet available for this meeting. "
+                            "Insights typically become available ~4 hours after the meeting ends. "
+                            "Ensure transcription was enabled during the meeting.",
+                        )
+                    ],
+                )
+            
+            insight = self._parse_insight_from_sdk(meeting_id, result)
 
-        if response.status_code == 404:
-            return MeetingInsight(
-                meeting_id=meeting_id,
-                notes=[
-                    MeetingNote(
-                        title="No Insights Available",
-                        text="AI insights are not yet available for this meeting. "
-                        "Insights typically become available ~4 hours after the meeting ends. "
-                        "Ensure transcription was enabled during the meeting.",
-                    )
-                ],
-            )
-
-        if response.status_code != 200:
-            logger.error(
-                "[%s] Get insights failed: %d %s",
+            logger.info(
+                "[%s] Got insights: %d notes, %d actions, %d mentions",
                 request_id,
-                response.status_code,
-                response.text,
-            )
-            raise MeetingsApiError(
-                f"Failed to get meeting insights: {response.status_code}"
+                len(insight.notes),
+                len(insight.action_items),
+                len(insight.mentions),
             )
 
-        data = response.json()
-        insight = self._parse_insight(meeting_id, data)
-
-        logger.info(
-            "[%s] Got insights: %d notes, %d actions, %d mentions",
-            request_id,
-            len(insight.notes),
-            len(insight.action_items),
-            len(insight.mentions),
-        )
-
-        return insight
+            return insight
+            
+        except Exception as e:
+            # Check if it's a 404-like error
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                return MeetingInsight(
+                    meeting_id=meeting_id,
+                    notes=[
+                        MeetingNote(
+                            title="No Insights Available",
+                            text="AI insights are not yet available for this meeting. "
+                            "Insights typically become available ~4 hours after the meeting ends. "
+                            "Ensure transcription was enabled during the meeting.",
+                        )
+                    ],
+                )
+            
+            logger.error(
+                "[%s] Get insights failed: %s",
+                request_id,
+                str(e),
+            )
+            raise MeetingsApiError(f"Failed to get meeting insights: {e}")
 
     async def _get_current_user_id(self, request_id: str) -> str:
-        """Get the current user's ID from Graph."""
-        url = f"{self.V1_BASE_URL}/me"
-
-        response = await self._make_request(
-            "GET",
-            url,
-            request_id=request_id,
-        )
-
-        if response.status_code != 200:
-            raise MeetingsApiError("Failed to get current user info")
-
-        data = response.json()
-        return data.get("id", "")
+        """Get the current user's ID from Graph /me endpoint."""
+        from m365_copilot.auth import GRAPH_SCOPES
+        
+        try:
+            # Get access token
+            token = self.credential.get_token(*GRAPH_SCOPES)
+            
+            # Call /me endpoint with raw HTTP (M365 Copilot SDK doesn't include /me)
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://graph.microsoft.com/v1.0/me",
+                    headers={"Authorization": f"Bearer {token.token}"},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                user_id = data.get("id")
+                if not user_id:
+                    raise MeetingsApiError("Failed to get current user info: no ID returned")
+                return user_id
+                
+        except httpx.HTTPStatusError as e:
+            raise MeetingsApiError(f"Failed to get current user info: HTTP {e.response.status_code}")
+        except Exception as e:
+            raise MeetingsApiError(f"Failed to get current user info: {e}")
 
     def _extract_meeting_id(self, join_url: str) -> str:
         """Extract meeting ID from Teams join URL."""
@@ -301,10 +408,10 @@ class MeetingsClient(GraphClient):
             return match.group(1)
         return ""
 
-    def _parse_insight(self, meeting_id: str, data: dict[str, Any]) -> MeetingInsight:
-        """Parse insight from API response."""
+    def _parse_insight_from_sdk(self, meeting_id: str, data: Any) -> MeetingInsight:
+        """Parse insight from SDK response."""
         # Get the first insight (usually only one per meeting)
-        insights_list = data.get("value", [])
+        insights_list = data.value if hasattr(data, 'value') and data.value else []
         if not insights_list:
             return MeetingInsight(meeting_id=meeting_id)
 
@@ -312,45 +419,52 @@ class MeetingsClient(GraphClient):
 
         # Parse meeting notes
         notes = []
-        for note_data in insight_data.get("meetingNotes", []):
+        meeting_notes_list = getattr(insight_data, 'meeting_notes', None) or []
+        for note_data in meeting_notes_list:
+            subpoints_list = getattr(note_data, 'subpoints', None) or []
             note = MeetingNote(
-                title=note_data.get("title", ""),
-                text=note_data.get("text", ""),
+                title=getattr(note_data, 'title', '') or '',
+                text=getattr(note_data, 'text', '') or '',
                 subpoints=[
                     MeetingNote(
-                        title=sub.get("title", ""),
-                        text=sub.get("text", ""),
+                        title=getattr(sub, 'title', '') or '',
+                        text=getattr(sub, 'text', '') or '',
                     )
-                    for sub in note_data.get("subpoints", [])
+                    for sub in subpoints_list
                 ],
             )
             notes.append(note)
 
         # Parse action items
         action_items = []
-        for item_data in insight_data.get("actionItems", []):
+        action_items_list = getattr(insight_data, 'action_items', None) or []
+        for item_data in action_items_list:
             item = ActionItem(
-                title=item_data.get("title", ""),
-                text=item_data.get("text", ""),
-                owner=item_data.get("ownerDisplayName"),
+                title=getattr(item_data, 'title', '') or '',
+                text=getattr(item_data, 'text', '') or '',
+                owner=getattr(item_data, 'owner_display_name', None),
             )
             action_items.append(item)
 
         # Parse mention events (from viewpoint)
         mentions = []
-        viewpoint = insight_data.get("viewpoint", {})
-        for mention_data in viewpoint.get("mentionEvents", []):
-            mention = MentionEvent(
-                timestamp=mention_data.get("eventDateTime", ""),
-                text=mention_data.get("transcriptUtterance", ""),
-                speaker=mention_data.get("speaker", {}).get("displayName", "Unknown"),
-            )
-            mentions.append(mention)
+        viewpoint = getattr(insight_data, 'viewpoint', None)
+        if viewpoint:
+            mention_events_list = getattr(viewpoint, 'mention_events', None) or []
+            for mention_data in mention_events_list:
+                speaker = getattr(mention_data, 'speaker', None)
+                speaker_name = getattr(speaker, 'display_name', 'Unknown') if speaker else 'Unknown'
+                mention = MentionEvent(
+                    timestamp=str(getattr(mention_data, 'event_date_time', '')) or '',
+                    text=getattr(mention_data, 'transcript_utterance', '') or '',
+                    speaker=speaker_name,
+                )
+                mentions.append(mention)
 
         return MeetingInsight(
             meeting_id=meeting_id,
-            meeting_title=insight_data.get("subject"),
-            meeting_date=insight_data.get("startDateTime"),
+            meeting_title=getattr(insight_data, 'subject', None),
+            meeting_date=str(getattr(insight_data, 'start_date_time', '')) if hasattr(insight_data, 'start_date_time') else None,
             notes=notes,
             action_items=action_items,
             mentions=mentions,

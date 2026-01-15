@@ -1,10 +1,12 @@
 """Chat API client for M365 Copilot.
 
-Implements the Chat API using httpx-sse for streaming responses (ADR-004, ADR-006).
+Implements the Chat API using the official Microsoft SDK (microsoft-agents-m365copilot-beta).
+Falls back to streaming endpoint if available.
 
 Endpoints:
-- POST /beta/copilot/conversations - Create conversation
-- POST /beta/copilot/conversations/{id}/chatOverStream - Streaming chat (SSE)
+- POST /copilot/conversations - Create conversation
+- POST /copilot/conversations/{id}/microsoft.graph.copilot.chat - Synchronous chat
+- POST /copilot/conversations/{id}/microsoft.graph.copilot.chatOverStream - Streaming (SSE)
 """
 
 from __future__ import annotations
@@ -12,14 +14,29 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from httpx_sse import aconnect_sse
+from httpx_sse import aconnect_sse, SSEError
+
+from microsoft_agents_m365copilot_beta import (
+    AgentsM365CopilotBetaServiceClient,
+)
+from microsoft_agents_m365copilot_beta.generated.models.copilot_conversation import (
+    CopilotConversation,
+)
+from microsoft_agents_m365copilot_beta.generated.models.copilot_conversation_location import (
+    CopilotConversationLocation,
+)
+from microsoft_agents_m365copilot_beta.generated.models.copilot_conversation_request_message_parameter import (
+    CopilotConversationRequestMessageParameter,
+)
+from microsoft_agents_m365copilot_beta.generated.copilot.conversations.item.microsoft_graph_copilot_chat.chat_post_request_body import (
+    ChatPostRequestBody,
+)
 
 from m365_copilot.clients.base import (
     Attribution,
-    GraphClient,
     format_citations,
     format_sensitivity_label,
     gen_request_id,
@@ -61,8 +78,10 @@ class ChatResponse:
         return "\n".join(parts)
 
 
-class ChatClient(GraphClient):
-    """Client for M365 Copilot Chat API with SSE streaming."""
+class ChatClient:
+    """Client for M365 Copilot Chat API using official Microsoft SDK."""
+
+    BETA_BASE_URL = "https://graph.microsoft.com/beta"
 
     def __init__(
         self,
@@ -70,7 +89,18 @@ class ChatClient(GraphClient):
         *,
         timeout: int | None = None,
     ) -> None:
-        super().__init__(credential, timeout=timeout or CHAT_TIMEOUT)
+        self.credential = credential
+        self.timeout = timeout or CHAT_TIMEOUT
+        
+        # Create SDK client with correct beta API configuration
+        from m365_copilot.auth import create_sdk_client
+        self._sdk_client = create_sdk_client(credential)
+
+    async def _get_access_token(self) -> str:
+        """Get access token from credential."""
+        from m365_copilot.auth import GRAPH_SCOPES
+        token = self.credential.get_token(*GRAPH_SCOPES)
+        return token.token
 
     async def create_conversation(self) -> str:
         """Create a new conversation and return its ID.
@@ -79,30 +109,22 @@ class ChatClient(GraphClient):
             Conversation ID from M365 Copilot.
         """
         request_id = gen_request_id()
-        url = f"{self.BETA_BASE_URL}/copilot/conversations"
 
-        response = await self._make_request(
-            "POST",
-            url,
-            json={},
-            request_id=request_id,
-        )
-
-        if response.status_code != 201:
-            logger.error(
-                "[%s] Failed to create conversation: %d %s",
-                request_id,
-                response.status_code,
-                response.text,
-            )
-            raise ChatApiError(
-                f"Failed to create conversation: {response.status_code}"
-            )
-
-        data = response.json()
-        conversation_id = data.get("id")
-        logger.info("[%s] Created conversation: %s", request_id, conversation_id)
-        return conversation_id
+        try:
+            # Use SDK to create conversation
+            new_conversation = CopilotConversation()
+            result = await self._sdk_client.copilot.conversations.post(new_conversation)
+            
+            if result is None or result.id is None:
+                raise ChatApiError("Failed to create conversation: no ID returned")
+            
+            conversation_id = result.id
+            logger.info("[%s] Created conversation: %s", request_id, conversation_id)
+            return conversation_id
+            
+        except Exception as e:
+            logger.error("[%s] Failed to create conversation: %s", request_id, str(e))
+            raise ChatApiError(f"Failed to create conversation: {e}")
 
     async def chat(
         self,
@@ -113,9 +135,10 @@ class ChatClient(GraphClient):
         file_uris: list[str] | None = None,
         request_id: str | None = None,
     ) -> ChatResponse:
-        """Send a chat message and get streaming response.
+        """Send a chat message and get response.
 
-        Uses SSE endpoint for streaming, accumulates all chunks (ADR-004).
+        Uses official SDK with proper model serialization.
+        Falls back to streaming endpoint for better UX if SDK fails.
 
         Args:
             conversation_id: ID of existing conversation.
@@ -128,7 +151,6 @@ class ChatClient(GraphClient):
             ChatResponse with full accumulated text and attributions.
         """
         request_id = request_id or gen_request_id()
-        url = f"{self.BETA_BASE_URL}/copilot/conversations/{conversation_id}/chatOverStream"
 
         logger.info(
             "[%s] Chat: %s (web=%s, files=%d)",
@@ -138,30 +160,146 @@ class ChatClient(GraphClient):
             len(file_uris) if file_uris else 0,
         )
 
-        # Build request body
-        body: dict[str, Any] = {
-            "messages": [
-                {
-                    "content": message,
-                    "role": "user",
-                }
-            ],
-        }
+        # Try SDK-based synchronous endpoint first (proper model serialization)
+        try:
+            return await self._chat_sdk(
+                conversation_id, message, web_search, file_uris, request_id
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] SDK chat failed, trying streaming fallback: %s",
+                request_id,
+                str(e),
+            )
+            # Fall back to streaming endpoint
+            token = await self._get_access_token()
+            return await self._chat_streaming(
+                conversation_id, message, token, web_search, file_uris, request_id
+            )
 
-        # Add grounding options
+    async def _chat_sdk(
+        self,
+        conversation_id: str,
+        message: str,
+        web_search: bool,
+        file_uris: list[str] | None,
+        request_id: str,
+    ) -> ChatResponse:
+        """Use official SDK for chat - handles timezone format correctly."""
+        
+        # Build request body using SDK models
+        request_body = ChatPostRequestBody()
+        
+        # Set message using the proper SDK model
+        msg_param = CopilotConversationRequestMessageParameter()
+        msg_param.text = message
+        request_body.message = msg_param
+        
+        # Set location hint with timezone
+        # The SDK model serializes this correctly as "timeZone" (camelCase)
+        location = CopilotConversationLocation()
+        location.time_zone = "America/Los_Angeles"
+        request_body.location_hint = location
+        
+        # Add grounding options via additional_data if web search disabled
+        if not web_search:
+            request_body.additional_data["groundingOptions"] = {"disableWebGrounding": True}
+        
+        # Add file context via additional_data if provided
+        if file_uris:
+            request_body.additional_data["externalContexts"] = [
+                {"type": "fileUri", "value": uri} for uri in file_uris
+            ]
+
+        # Call the SDK chat endpoint
+        result = await self._sdk_client.copilot.conversations.by_copilot_conversation_id(
+            conversation_id
+        ).microsoft_graph_copilot_chat.post(request_body)
+        
+        if result is None:
+            raise ChatApiError("Chat returned no response")
+        
+        # Parse response from SDK result
+        text = ""
+        attributions: list[Attribution] = []
+        sensitivity_label: str | None = None
+        turn_count = result.turn_count or 1
+        
+        # Extract assistant response from messages
+        # Messages list contains: [user_message, assistant_response]
+        # We want the last message which is the assistant's response
+        if result.messages and len(result.messages) > 0:
+            # Get the last message (assistant response)
+            # Usually messages[0] is echo of user input, messages[1] is assistant response
+            assistant_msg = result.messages[-1]
+            
+            # Get text from the message
+            if hasattr(assistant_msg, 'text') and assistant_msg.text:
+                text = assistant_msg.text
+            
+            # Get attributions
+            if hasattr(assistant_msg, 'attributions') and assistant_msg.attributions:
+                for attr in assistant_msg.attributions:
+                    attributions.append(
+                        Attribution(
+                            type=getattr(attr, 'type', 'citation') or 'citation',
+                            text=getattr(attr, 'text', '') or '',
+                            url=getattr(attr, 'url', None),
+                            title=getattr(attr, 'title', None),
+                        )
+                    )
+            
+            # Get sensitivity label
+            if hasattr(assistant_msg, 'sensitivity_label') and assistant_msg.sensitivity_label:
+                sl = assistant_msg.sensitivity_label
+                if hasattr(sl, 'display_name') and sl.display_name:
+                    sensitivity_label = sl.display_name
+        
+        logger.info(
+            "[%s] Chat (SDK) complete: %d chars, %d citations",
+            request_id,
+            len(text),
+            len(attributions),
+        )
+
+        return ChatResponse(
+            text=text,
+            conversation_id=conversation_id,
+            turn_count=turn_count,
+            attributions=attributions,
+            sensitivity_label=sensitivity_label,
+        )
+
+    async def _chat_streaming(
+        self,
+        conversation_id: str,
+        message: str,
+        token: str,
+        web_search: bool,
+        file_uris: list[str] | None,
+        request_id: str,
+    ) -> ChatResponse:
+        """Stream response using SSE endpoint (fallback)."""
+        url = f"{self.BETA_BASE_URL}/copilot/conversations/{conversation_id}/microsoft.graph.copilot.chatOverStream"
+
+        # Build body using SDK-compatible format
+        body: dict[str, Any] = {
+            "message": {
+                "text": message,
+            },
+            "locationHint": {
+                "timeZone": "America/Los_Angeles",
+            }
+        }
+        
         if not web_search:
             body["groundingOptions"] = {"disableWebGrounding": True}
-
-        # Add file context if provided
+        
         if file_uris:
             body["externalContexts"] = [
                 {"type": "fileUri", "value": uri} for uri in file_uris
             ]
 
-        # Get access token
-        token = await self._get_access_token()
-
-        # Stream response using SSE
         text_chunks: list[str] = []
         attributions: list[Attribution] = []
         sensitivity_label: str | None = None
@@ -246,7 +384,7 @@ class ChatClient(GraphClient):
 
         full_text = "".join(text_chunks)
         logger.info(
-            "[%s] Chat complete: %d chars, %d citations",
+            "[%s] Chat (streaming) complete: %d chars, %d citations",
             request_id,
             len(full_text),
             len(attributions),

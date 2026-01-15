@@ -38,7 +38,7 @@ Query SharePoint, OneDrive, email, calendar, and Teams meetings through natural 
    - `ChannelMessage.Read.All`
    - `ExternalItem.Read.All`
    - `Files.Read.All`
-   - `OnlineMeeting.Read`
+   - `OnlineMeetings.Read`
 7. Grant admin consent
 
 ### 2. Install
@@ -56,6 +56,80 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+### 2a. WSL-Specific Setup (Windows Subsystem for Linux)
+
+If running in WSL, additional setup is required for browser-based authentication:
+
+#### Enable WSL Interoperability
+
+WSL interoperability allows Linux to launch Windows executables (like browsers). Check if it's enabled:
+
+```bash
+ls /proc/sys/fs/binfmt_misc/WSLInterop
+```
+
+If the file doesn't exist, check your `/etc/wsl.conf`:
+
+```bash
+cat /etc/wsl.conf
+```
+
+Ensure interop is enabled (or not explicitly disabled):
+
+```ini
+[interop]
+enabled = true
+appendWindowsPath = true
+```
+
+After editing, restart WSL from **Windows PowerShell**:
+
+```powershell
+wsl --shutdown
+```
+
+Then reopen your WSL terminal.
+
+#### Install wslu (WSL Utilities)
+
+[wslu](https://wslutiliti.es/wslu/) provides `wslview` which opens Windows browsers from WSL:
+
+```bash
+# Ubuntu/Debian
+sudo apt install wslu
+
+# Other distros: see https://wslutiliti.es/wslu/install.html
+```
+
+Verify installation:
+
+```bash
+wslview https://google.com
+```
+
+This should open Google in your Windows default browser.
+
+#### Alternative: Run from Windows
+
+If WSL interop doesn't work in your environment, you can configure VS Code to use Windows Python instead of WSL Python in your `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "m365-copilot": {
+      "type": "stdio",
+      "command": "C:\\path\\to\\m365-copilot-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "m365_copilot.server"],
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "AZURE_CLIENT_ID": "your-app-client-id",
+        "AZURE_TENANT_ID": "your-tenant-id"
+      }
+    }
+  }
+}
+```
+
 ### 3. Configure
 
 Create a `.env` file:
@@ -63,9 +137,22 @@ Create a `.env` file:
 ```bash
 AZURE_CLIENT_ID=your-app-client-id
 AZURE_TENANT_ID=your-tenant-id
+
+# Optional: specify account when multiple are cached
+# AZURE_USERNAME=user@contoso.com
 ```
 
-### 4. Test Locally
+### 4. Authenticate (One-Time)
+
+Run the authentication command once to cache your credentials:
+
+```bash
+m365-copilot --auth
+```
+
+A browser window will open. Sign in with your M365 account. Your credentials are saved to `~/.m365-copilot-mcp/` for future use.
+
+### 5. Test Locally
 
 ```bash
 # Run in HTTP mode for debugging
@@ -144,12 +231,75 @@ Add to `claude_desktop_config.json`:
 
 ## Authentication Flow
 
-On first run, you'll be prompted to authenticate:
+This MCP server uses **delegated permissions**, meaning it accesses Microsoft 365 data **on behalf of you**, the signed-in user.
 
-1. **Browser auth** (default): Opens browser for Microsoft sign-in
-2. **Device code** (fallback): For headless environments, displays a code to enter at microsoft.com/devicelogin
+### How It Works
 
-Tokens are cached locally in `~/.m365-copilot-mcp/` for subsequent runs.
+```
+┌─────────────┐     ┌─────────────────┐     ┌──────────────┐     ┌─────────────┐
+│   VS Code   │     │   MCP Server    │     │  Microsoft   │     │   Graph     │
+│   Copilot   │     │  (subprocess)   │     │  Entra ID    │     │   API       │
+└──────┬──────┘     └────────┬────────┘     └──────┬───────┘     └──────┬──────┘
+       │                     │                     │                    │
+       │ 1. Start server     │                     │                    │
+       ├────────────────────►│                     │                    │
+       │                     │                     │                    │
+       │ 2. Tool call        │                     │                    │
+       ├────────────────────►│                     │                    │
+       │                     │                     │                    │
+       │                     │ 3. Opens browser    │                    │
+       │◄─ ─ ─ ─ ─ ─ ─ ─ ─ ─►│    for sign-in     │                    │
+       │                     │                     │                    │
+       │ 4. YOU sign in ─────────────────────────►│                    │
+       │                     │                     │                    │
+       │                     │ 5. Token (for YOU)  │                    │
+       │                     │◄────────────────────┤                    │
+       │                     │                     │                    │
+       │                     │ 6. API call with YOUR token             │
+       │                     ├─────────────────────────────────────────►│
+       │                     │                     │                    │
+       │                     │ 7. YOUR data only                       │
+       │ 8. Results          │◄─────────────────────────────────────────┤
+       │◄────────────────────┤                     │                    │
+```
+
+### Key Security Points
+
+| Aspect | Explanation |
+|--------|-------------|
+| **App Registration (SPN)** | Defines what permissions *can* be requested—not whose data is accessed |
+| **User Sign-in** | Required on first use; you authenticate with your M365 account |
+| **Access Token** | Contains YOUR identity; grants access only to YOUR mailbox, files, etc. |
+| **Token Cache** | Stored locally in `~/.m365-copilot-mcp/` for subsequent runs |
+
+### Authentication Methods
+
+1. **Interactive Browser** (default): Opens your browser for Microsoft sign-in
+2. **Device Code** (fallback): For headless/SSH environments—displays a code to enter at [microsoft.com/devicelogin](https://microsoft.com/devicelogin)
+
+### First-Time Setup
+
+**Recommended:** Run `m365-copilot --auth` once before using with VS Code or Claude Desktop. This caches your credentials so the MCP server can authenticate silently.
+
+If you skip this step, you'll see on first tool use:
+
+- **Browser flow**: A browser window opens → Sign in with your M365 account → Consent to permissions
+- **Device code flow**: A message in VS Code Output panel with a code → Visit the URL → Enter the code → Sign in
+
+After authentication, tokens are cached and subsequent requests don't require re-authentication (until token expires, typically 1-24 hours depending on tenant policy).
+
+### Why Delegated Permissions?
+
+This approach is more secure for personal developer tools:
+
+| Delegated (This Server) | Application Permissions |
+|------------------------|------------------------|
+| ✅ Requires user sign-in | ❌ No user sign-in needed |
+| ✅ Access only YOUR data | ⚠️ Access ANY user's data |
+| ✅ User or admin consent | ⚠️ Admin consent required |
+| ✅ Ideal for personal tools | Better for background services |
+
+The SPN cannot access any Microsoft 365 data without you explicitly signing in first.
 
 ## Environment Variables
 
@@ -163,12 +313,23 @@ Tokens are cached locally in `~/.m365-copilot-mcp/` for subsequent runs.
 
 ## Troubleshooting
 
+### WSL: "WSL Interoperability is disabled"
+- Check `/etc/wsl.conf` for `[interop] enabled = false` and remove/change it
+- Restart WSL: `wsl --shutdown` from Windows PowerShell
+- Verify with: `ls /proc/sys/fs/binfmt_misc/WSLInterop`
+
+### WSL: Browser doesn't open
+- Install wslu: `sudo apt install wslu`
+- Test: `wslview https://google.com`
+- Alternative: Run `python login.py` from Windows PowerShell
+
 ### "Insufficient permissions"
 - Ensure admin consent is granted for all API permissions
 - Verify user has Microsoft 365 Copilot license
 
 ### "Token expired"
-- Delete `~/.m365-copilot-mcp/` and re-authenticate
+- Run `m365-copilot --auth` to re-authenticate
+- Or delete `~/.m365-copilot-mcp/` and re-authenticate
 
 ### "Gateway timeout" on long queries
 - Break complex queries into smaller parts
